@@ -1,0 +1,279 @@
+name: jobsched
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: jobsched-app:local
+  restart: unless-stopped
+  stop_grace_period: 40s
+  networks: [jobsched]
+
+x-env: &env
+  CONTROL_DATABASE_URL: postgres://jobsched:jobsched@control-db:5432/jobsched_control
+  SHARD_DSN_MAP: '{"shard-a":"postgres://jobsched:jobsched@shard-a:5432/jobsched_shard","shard-b":"postgres://jobsched:jobsched@shard-b:5432/jobsched_shard"}'
+  SHARD_IDS: shard-a,shard-b
+  LOG_LEVEL: info
+
+x-pg-health: &pg-health
+  test: ["CMD-SHELL", "pg_isready -U jobsched -d postgres"]
+  interval: 3s
+  timeout: 3s
+  retries: 30
+
+services:
+  control-db:
+    image: postgres:16-alpine
+    container_name: jobsched-control-db
+    environment:
+      POSTGRES_USER: jobsched
+      POSTGRES_PASSWORD: jobsched
+      POSTGRES_DB: jobsched_control
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - autovacuum_naptime=5s
+      - -c
+      - autovacuum_max_workers=3
+      - -c
+      - log_autovacuum_min_duration=1000
+    ports: ["55432:5432"]
+    volumes: [control-data:/var/lib/postgresql/data]
+    healthcheck: *pg-health
+    mem_limit: 512m
+    networks: [jobsched]
+
+  shard-a:
+    image: postgres:16-alpine
+    container_name: jobsched-shard-a
+    environment:
+      POSTGRES_USER: jobsched
+      POSTGRES_PASSWORD: jobsched
+      POSTGRES_DB: jobsched_shard
+    command:
+      - postgres
+      - -c
+      - max_connections=250
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - autovacuum_naptime=5s
+      - -c
+      - autovacuum_max_workers=4
+      - -c
+      - log_autovacuum_min_duration=1000
+    ports: ["55433:5432"]
+    volumes: [shard-a-data:/var/lib/postgresql/data]
+    healthcheck: *pg-health
+    mem_limit: 768m
+    networks: [jobsched]
+
+  shard-b:
+    image: postgres:16-alpine
+    container_name: jobsched-shard-b
+    environment:
+      POSTGRES_USER: jobsched
+      POSTGRES_PASSWORD: jobsched
+      POSTGRES_DB: jobsched_shard
+    command:
+      - postgres
+      - -c
+      - max_connections=250
+      - -c
+      - shared_buffers=384MB
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - autovacuum_naptime=5s
+      - -c
+      - autovacuum_max_workers=4
+      - -c
+      - log_autovacuum_min_duration=1000
+    ports: ["55434:5432"]
+    volumes: [shard-b-data:/var/lib/postgresql/data]
+    healthcheck: *pg-health
+    mem_limit: 768m
+    networks: [jobsched]
+
+  migrate:
+    <<: *app
+    container_name: jobsched-migrate
+    command: ["node", "dist/migrate.js"]
+    environment:
+      <<: *env
+    depends_on:
+      control-db: { condition: service_healthy }
+      shard-a: { condition: service_healthy }
+      shard-b: { condition: service_healthy }
+    restart: "no"
+    mem_limit: 128m
+
+  api:
+    <<: *app
+    container_name: jobsched-api
+    command: ["node", "dist/services/api-main.js"]
+    environment:
+      <<: *env
+      API_PORT: "3000"
+      API_DB_POOL_MAX: "20"
+    ports: ["3000:3000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+
+  scheduler-1:
+    <<: *app
+    container_name: jobsched-scheduler-1
+    command: ["node", "dist/services/scheduler-main.js"]
+    environment:
+      <<: *env
+      SCHEDULER_ID: scheduler-1
+      OPS_PORT: "9101"
+      SCHEDULER_DB_POOL_MAX: "8"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9101/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+
+  scheduler-2:
+    <<: *app
+    container_name: jobsched-scheduler-2
+    command: ["node", "dist/services/scheduler-main.js"]
+    environment:
+      <<: *env
+      SCHEDULER_ID: scheduler-2
+      OPS_PORT: "9101"
+      SCHEDULER_DB_POOL_MAX: "8"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9101/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 256m
+
+  worker-1:
+    <<: *app
+    container_name: jobsched-worker-1
+    command: ["node", "dist/services/worker-main.js"]
+    environment: &worker-env
+      <<: *env
+      WORKER_ID: worker-1
+      OPS_PORT: "9101"
+      WORKER_DB_POOL_MAX: "18"
+      WORKER_CONCURRENCY: "64"
+      CLAIM_BATCH_SIZE: "100"
+      COMPLETION_BATCH_SIZE: "100"
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9101/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+
+  worker-2:
+    <<: *app
+    container_name: jobsched-worker-2
+    command: ["node", "dist/services/worker-main.js"]
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-2
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9101/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+
+  worker-3:
+    <<: *app
+    container_name: jobsched-worker-3
+    command: ["node", "dist/services/worker-main.js"]
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-3
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9101/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+
+  worker-4:
+    <<: *app
+    container_name: jobsched-worker-4
+    command: ["node", "dist/services/worker-main.js"]
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-4
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9101/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+
+  loadgen:
+    <<: *app
+    container_name: jobsched-loadgen
+    command: ["node", "dist/tools/loadgen.js"]
+    environment:
+      <<: *env
+      API_URL: http://api:3000
+      LOADGEN_RATE: "600"
+      LOADGEN_DURATION_SEC: "300"
+    depends_on:
+      api: { condition: service_healthy }
+    profiles: ["tools"]
+    restart: "no"
+    volumes: ["./benchmarks:/app/benchmarks"]
+    mem_limit: 384m
+
+networks:
+  jobsched:
+    driver: bridge
+
+volumes:
+  control-data:
+  shard-a-data:
+  shard-b-data:
+
+

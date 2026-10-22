@@ -1,0 +1,52 @@
+flowchart LR
+    LG["Load generator<br/>POST /jobs/batch<br/>620 offered/s"] -->|"unique one-off jobs"| API["Fastify API<br/>batch limit 500"]
+
+    API -->|"create / cancel jobs"| C[("control PostgreSQL<br/>jobs, shard_map,<br/>partition_leases,<br/>scheduler_registry")]
+    API -->|"read run status / history"| SA
+    API -->|"read run status / history"| SB
+
+    C -->|"due jobs + lease ownership"| S1["scheduler-1<br/>32 partitions"]
+    C -->|"due jobs + lease ownership"| S2["scheduler-2<br/>32 partitions"]
+
+    S1 -->|"fenced trigger insert<br/>run_keys + runs"| SA[("shard-a PostgreSQL<br/>runs, run_keys,<br/>run_history,<br/>partition_fence")]
+    S1 -->|"fenced trigger insert"| SB[("shard-b PostgreSQL<br/>runs, run_keys,<br/>run_history,<br/>partition_fence")]
+    S2 -->|"fenced trigger insert"| SA
+    S2 -->|"fenced trigger insert"| SB
+
+    S1 -->|"advance job after<br/>durable trigger"| C
+    S2 -->|"advance job after<br/>durable trigger"| C
+
+    W1["worker-1<br/>64 slots"] -->|"claim SKIP LOCKED<br/>heartbeat / complete"| SA
+    W1 -->|"claim / complete"| SB
+    W2["worker-2<br/>64 slots"] --> SA
+    W2 --> SB
+    W3["worker-3<br/>64 slots"] --> SA
+    W3 --> SB
+    W4["worker-4<br/>64 slots"] --> SA
+    W4 --> SB
+
+    V["Verifier inside load generator<br/>direct SQL checks"] -.->|"distinct triggers,<br/>duplicates, loss,<br/>latency, queue depth"| SA
+    V -.->|"same checks"| SB
+
+    M["Prometheus metrics<br/>API, schedulers, workers"] -.-> API
+    M -.-> S1
+    M -.-> S2
+    M -.-> W1
+    M -.-> W2
+    M -.-> W3
+    M -.-> W4
+
+    subgraph CONTROL["Control plane"]
+        C
+        S1
+        S2
+    end
+
+    subgraph DATA["Shard data plane"]
+        SA
+        SB
+        W1
+        W2
+        W3
+        W4
+    end
